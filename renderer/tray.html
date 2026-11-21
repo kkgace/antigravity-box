@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;" />
+  <title>AntigravityBox 快捷面板</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body class="tray">
+  <div class="tray-wrap">
+    <div class="tabs">
+      <button id="tab-quota" class="active">配额</button>
+      <button id="tab-usage">用量</button>
+      <button id="tab-accounts">账号</button>
+      <div style="flex:1"></div>
+      <button id="tray-more" title="更多" style="font-size:14px;padding:4px 10px;">···</button>
+      <button id="open-main" style="font-size:12px;">打开主界面 ↗</button>
+    </div>
+    <div class="content" id="content"><div class="loading">加载中…</div></div>
+    <div class="tray-footer"><span style="color:var(--fg-faint);font-size:11px" id="conn"></span></div>
+  </div>
+  <div id="tray-menu" class="tray-menu" hidden>
+    <button id="menu-open-main">打开主界面</button>
+    <div class="menu-sep"></div>
+    <div class="menu-title">显示语言</div>
+    <button data-lang="system" class="menu-lang">跟随系统</button>
+    <button data-lang="zh-Hans" class="menu-lang">简体中文</button>
+    <button data-lang="en" class="menu-lang">English</button>
+    <div class="menu-sep"></div>
+    <label class="menu-row"><span>对话状态栏</span><input type="checkbox" id="menu-hud" /></label>
+    <div class="menu-sep"></div>
+    <button id="menu-quit">退出</button>
+  </div>
+  <script type="module" src="tray.js"></script>
+</body>
+</html>

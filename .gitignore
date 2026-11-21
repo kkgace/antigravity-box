@@ -1,0 +1,11 @@
+# dependencies & build output
+node_modules/
+dist/
+release/
+
+# dev-only: locally extracted Antigravity UI string snapshots (regenerable via tools/extract-ui-strings.mjs)
+ui-strings/
+
+# diagnostics & logs
+.dbg/
+*.log

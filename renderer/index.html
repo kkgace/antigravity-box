@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;" />
+  <title>AntigravityBox</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="layout">
+    <nav class="sidebar">
+      <div class="brand"><img src="icon.png" alt="" /><span>AntigravityBox</span></div>
+      <button class="nav-item active" data-target="overview">🛰 <span>总览</span></button>
+      <button class="nav-item" data-target="accounts">👤 <span>账号</span></button>
+      <button class="nav-item" data-target="usage">📊 <span>用量</span></button>
+      <button class="nav-item" data-target="conversations">💬 <span>会话库</span></button>
+      <button class="nav-item" data-target="storage">🧹 <span>存储</span></button>
+      <button class="nav-item" data-target="settings">⚙️ <span>设置</span></button>
+      <button class="nav-item" data-target="about">ℹ️ <span>关于</span></button>
+      <div class="spacer"></div>
+      <div class="conn" id="conn-info">正在连接…</div>
+    </nav>
+    <main class="main">
+      <section class="page active" data-page="overview" id="page-overview"></section>
+      <section class="page" data-page="accounts" id="page-accounts"></section>
+      <section class="page" data-page="usage" id="page-usage"></section>
+      <section class="page" data-page="conversations" id="page-conversations"></section>
+      <section class="page" data-page="storage" id="page-storage"></section>
+      <section class="page" data-page="settings" id="page-settings"></section>
+      <section class="page" data-page="about" id="page-about"></section>
+    </main>
+  </div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,621 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, mkdir, writeFile, readFile, rm, lstat, utimes, realpath } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, basename } from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { CacheMaintenance } from '../dist/core/maintenance.js';
+import { UsageStatsManager } from '../dist/core/usage.js';
+import { ProtobufWriter } from '../dist/core/protobuf.js';
+
+const { execFileAsync } = await import('./helpers/sqlite-cli-shim.mjs');
+
+async function setAgeDays(targetPath, daysAgo) {
+  const sec = (Date.now() - daysAgo * 86_400_000) / 1000;
+  await utimes(targetPath, sec, sec);
+}
+
+async function createUsageDb(dbPath, { model = 'gemini-3.8-flash', input = 1500, output = 1000, cached = 4000, tsSec }) {
+  const field19 = ProtobufWriter.encodeString(19, model);
+  const usageMsg = Buffer.concat([
+    ProtobufWriter.encodeVarintField(1, 1318),
+    ProtobufWriter.encodeVarintField(2, input),
+    ProtobufWriter.encodeVarintField(3, output),
+    ProtobufWriter.encodeVarintField(5, cached),
+  ]);
+  const field4 = ProtobufWriter.encodeLengthDelimited(4, usageMsg);
+  const timingInner = ProtobufWriter.encodeLengthDelimited(4, ProtobufWriter.encodeVarintField(1, tsSec));
+  const field9 = ProtobufWriter.encodeLengthDelimited(9, timingInner);
+  const wrapped = Buffer.concat([field19, field4, field9]);
+  const hexBlob = ProtobufWriter.encodeLengthDelimited(1, wrapped).toString('hex');
+
+  const sql = `
+    CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB, status INTEGER, step_payload BLOB);
+    CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);
+    INSERT INTO gen_metadata (idx, data) VALUES (1, X'${hexBlob}');
+  `;
+  await execFileAsync('/usr/bin/sqlite3', [dbPath, sql]);
+}
+
+async function createSummariesDb(dbPath, summaries, archivedIds = []) {
+  const lines = [
+    'CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, summary TEXT, updated_at INTEGER, parent_conversation_id TEXT, status TEXT);',
+    'CREATE TABLE conversations_fts (conversation_id TEXT, title TEXT, archived INTEGER);',
+  ];
+  for (const s of summaries) {
+    lines.push(
+      `INSERT INTO conversation_summaries (conversation_id, summary, updated_at, parent_conversation_id, status) VALUES ('${s.id}', 'sum', ${s.updatedAt ?? 1760000000}, '${s.parentId ?? ''}', '${s.status ?? 'CASCADE_RUN_STATUS_IDLE'}');`
+    );
+  }
+  for (const cid of archivedIds) {
+    lines.push(`INSERT INTO conversations_fts (conversation_id, title, archived) VALUES ('${cid}', 'archived chat', 1);`);
+  }
+  await execFileAsync('/usr/bin/sqlite3', [dbPath, lines.join('\n')]);
+}
+
+test('v2 存储治理: PartitionsCache 与 AgentBrowserCache 精确剥离无状态缓存，保护登录态且绝不触碰 Insiders', async () => {
+  const temp = await realpath(await mkdtemp(join(tmpdir(), 'gb-maint-v2-browser-')));
+  const profile = join(temp, 'profile');
+  const geminiDir = join(temp, 'gemini');
+  const trash = join(temp, 'trash');
+  const stateDir = join(temp, 'state');
+  await Promise.all([mkdir(profile), mkdir(geminiDir), mkdir(trash), mkdir(stateDir)]);
+
+  try {
+    // 1. Partitions 下同时包含无状态缓存与有状态凭据
+    await mkdir(join(profile, 'Partitions', 'webview-a', 'Cache'), { recursive: true });
+    await writeFile(join(profile, 'Partitions', 'webview-a', 'Cache', 'chunk.bin'), 'part-cache-a');
+    await mkdir(join(profile, 'Partitions', 'webview-a', 'Local Storage'), { recursive: true });
+    await writeFile(join(profile, 'Partitions', 'webview-a', 'Local Storage', 'leveldb.ldb'), 'keep-part-ls');
+    await writeFile(join(profile, 'Partitions', 'webview-a', 'Cookies'), 'keep-part-cookie');
+
+    // 2. 正式版 antigravity/browser_profile 同时包含无状态缓存与站点会话
+    const bp = join(geminiDir, 'antigravity', 'browser_profile');
+    await mkdir(join(bp, 'GraphiteDawnCache'), { recursive: true });
+    await writeFile(join(bp, 'GraphiteDawnCache', 'shader.bin'), 'top-graphite');
+    await mkdir(join(bp, 'Default', 'Cache'), { recursive: true });
+    await writeFile(join(bp, 'Default', 'Cache', 'http.bin'), 'default-cache');
+    await mkdir(join(bp, 'Default', 'Service Worker', 'CacheStorage'), { recursive: true });
+    await writeFile(join(bp, 'Default', 'Service Worker', 'CacheStorage', 'sw.bin'), 'sw-cache');
+    await writeFile(join(bp, 'Default', 'Service Worker', 'Database'), 'keep-sw-db');
+    await writeFile(join(bp, 'Default', 'Cookies'), 'keep-browser-cookies');
+    await mkdir(join(bp, 'Default', 'Sessions'), { recursive: true });
+    await writeFile(join(bp, 'Default', 'Sessions', 'Tabs_1'), 'keep-tabs');
+    await mkdir(join(bp, 'Profile 1', 'Code Cache'), { recursive: true });
+    await writeFile(join(bp, 'Profile 1', 'Code Cache', 'wasm.bin'), 'p1-code-cache');
+
+    // 3. Insiders 目录必须完全不受影响（AGENTS.md §2）
+    const insidersBp = join(geminiDir, 'antigravity-insiders', 'browser_profile', 'Default', 'Cache');
+    await mkdir(insidersBp, { recursive: true });
+    await writeFile(join(insidersBp, 'insiders.bin'), 'never-touch-insiders');
+
+    const m = new CacheMaintenance(profile, trash, async () => false, {
+      geminiDir,
+      stateDir,
+      browserRunning: async () => false,
+    });
+
+    const scan = await m.scan();
+    const partItem = scan.entries.find(e => e.name === 'PartitionsCache');
+    const browserItem = scan.entries.find(e => e.name === 'AgentBrowserCache');
+    assert.ok(partItem && partItem.bytes > 0 && partItem.category === 'safe' && partItem.defaultSelected === true);
+    assert.ok(browserItem && browserItem.bytes > 0 && browserItem.category === 'safe' && browserItem.defaultSelected === true);
+
+    const cleared = await m.clear(scan.token, ['PartitionsCache', 'AgentBrowserCache']);
+    assert.equal(cleared.moved, 2);
+
+    // 验证无状态缓存已移出原路径，有状态凭据与 Insiders 完好无损
+    await assert.rejects(lstat(join(profile, 'Partitions', 'webview-a', 'Cache')));
+    await assert.rejects(lstat(join(bp, 'Default', 'Cache')));
+    await assert.rejects(lstat(join(bp, 'Default', 'Service Worker', 'CacheStorage')));
+    await assert.rejects(lstat(join(bp, 'Profile 1', 'Code Cache')));
+    assert.equal(await readFile(join(profile, 'Partitions', 'webview-a', 'Cookies'), 'utf8'), 'keep-part-cookie');
+    assert.equal(await readFile(join(profile, 'Partitions', 'webview-a', 'Local Storage', 'leveldb.ldb'), 'utf8'), 'keep-part-ls');
+    assert.equal(await readFile(join(bp, 'Default', 'Cookies'), 'utf8'), 'keep-browser-cookies');
+    assert.equal(await readFile(join(bp, 'Default', 'Sessions', 'Tabs_1'), 'utf8'), 'keep-tabs');
+    assert.equal(await readFile(join(bp, 'Default', 'Service Worker', 'Database'), 'utf8'), 'keep-sw-db');
+    assert.equal(await readFile(join(insidersBp, 'insiders.bin'), 'utf8'), 'never-touch-insiders');
+
+    // 验证 schema: 2 多路径快照一键原位还原（包含期间重新生成的冲突目录安全归档至 displaced/）
+    await mkdir(join(bp, 'Default', 'Cache'), { recursive: true });
+    await writeFile(join(bp, 'Default', 'Cache', 'fresh.bin'), 'regenerated');
+
+    const history = await m.history();
+    assert.equal(history.length, 1);
+    assert.equal(history[0].restorable, true);
+    const restored = await m.restore(history[0].id);
+    assert.equal(restored.restored, 2);
+    assert.equal(restored.displacedCount, 1);
+    assert.equal(await readFile(join(bp, 'Default', 'Cache', 'http.bin'), 'utf8'), 'default-cache');
+    assert.equal(await readFile(join(bp, 'Profile 1', 'Code Cache', 'wasm.bin'), 'utf8'), 'p1-code-cache');
+    assert.equal(await readFile(join(profile, 'Partitions', 'webview-a', 'Cache', 'chunk.bin'), 'utf8'), 'part-cache-a');
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('v2 存储治理: 严格保护主对话、已归档对话树(archived=1)与运行中树(RUNNING)，精准识别孤儿残留并遵循 7/30/0 天保留窗口', async () => {
+  const temp = await realpath(await mkdtemp(join(tmpdir(), 'gb-maint-v2-conv-')));
+  const profile = join(temp, 'profile');
+  const geminiDir = join(temp, 'gemini');
+  const trash = join(temp, 'trash');
+  await Promise.all([mkdir(profile), mkdir(geminiDir), mkdir(trash)]);
+
+  const agentDir = join(geminiDir, 'antigravity');
+  const convDir = join(agentDir, 'conversations');
+  const brainDir = join(agentDir, 'brain');
+  await mkdir(convDir, { recursive: true });
+  await mkdir(brainDir, { recursive: true });
+
+  const rootOld = '11111111-1111-4111-8111-111111111111';     // 12 天前非活跃主对话
+  const subOld = '22222222-2222-4222-8222-222222222222';      // 12 天前非活跃 Subagent
+  const subRecent = '33333333-3333-4333-8333-333333333333';   // 2 天前非活跃 Subagent
+  const rootArchived = '44444444-4444-4444-8444-444444444444';// 20 天前已归档主对话
+  const subArchived = '55555555-5555-4555-8555-555555555555'; // 20 天前已归档主对话下的 Subagent
+  const rootRunning = '66666666-6666-4666-8666-666666666666'; // 运行中主对话
+  const subRunning = '77777777-7777-4777-8777-777777777777';  // 运行中主对话下的 Subagent
+  const subOrphan = '88888888-8888-4888-8888-888888888888';   // 父对话已删的孤儿 Subagent（仅 1 天前）
+  const deletedParent = '99999999-9999-4999-8999-999999999999';
+
+  try {
+    await createSummariesDb(
+      join(agentDir, 'conversation_summaries.db'),
+      [
+        { id: rootOld, parentId: '', status: 'CASCADE_RUN_STATUS_IDLE' },
+        { id: subOld, parentId: rootOld, status: 'CASCADE_RUN_STATUS_IDLE' },
+        { id: subRecent, parentId: rootOld, status: 'CASCADE_RUN_STATUS_IDLE' },
+        { id: rootArchived, parentId: '', status: 'CASCADE_RUN_STATUS_IDLE' },
+        { id: subArchived, parentId: rootArchived, status: 'CASCADE_RUN_STATUS_IDLE' },
+        { id: rootRunning, parentId: '', status: 'CASCADE_RUN_STATUS_RUNNING' },
+        { id: subRunning, parentId: rootRunning, status: 'CASCADE_RUN_STATUS_IDLE' },
+        { id: subOrphan, parentId: deletedParent, status: 'CASCADE_RUN_STATUS_IDLE' },
+      ],
+      [rootArchived]
+    );
+
+    const seedConvFiles = async (cid, daysAgo) => {
+      const dbPath = join(convDir, `${cid}.db`);
+      await writeFile(dbPath, `db-${cid}`);
+      const bPath = join(brainDir, cid);
+      await mkdir(join(bPath, '.system_generated', 'tasks'), { recursive: true });
+      await mkdir(join(bPath, '.system_generated', 'steps'), { recursive: true });
+      await mkdir(join(bPath, '.system_generated', 'logs', 'chunks'), { recursive: true });
+      await mkdir(join(bPath, 'scratch'), { recursive: true });
+      await writeFile(join(bPath, 'design_plan.md'), `artifact-${cid}`);
+      await writeFile(join(bPath, '.system_generated', 'tasks', 't1.log'), `tasklog-${cid}`);
+      await writeFile(join(bPath, '.system_generated', 'steps', 's1.txt'), `step-${cid}`);
+      await writeFile(join(bPath, 'scratch', 'tmp.py'), `scratch-${cid}`);
+      await writeFile(join(bPath, '.system_generated', 'logs', 'transcript.jsonl'), `compact-${cid}`);
+      await writeFile(join(bPath, '.system_generated', 'logs', 'transcript_full.jsonl'), `full-${cid}`);
+      await writeFile(join(bPath, '.system_generated', 'logs', 'chunks', '001.jsonl'), `chunk-${cid}`);
+
+      await setAgeDays(dbPath, daysAgo);
+      await setAgeDays(join(bPath, '.system_generated', 'logs', 'transcript.jsonl'), daysAgo);
+      await setAgeDays(bPath, daysAgo);
+    };
+
+    await seedConvFiles(rootOld, 12);
+    await seedConvFiles(subOld, 12);
+    await seedConvFiles(subRecent, 2);
+    await seedConvFiles(rootArchived, 20);
+    await seedConvFiles(subArchived, 20);
+    await seedConvFiles(rootRunning, 0.0005); // 约 43 秒前（近 3 分钟内活跃）
+    await seedConvFiles(subRunning, 20);      // 即使子任务旧，因整棵树处于 RUNNING 仍受保护
+    await seedConvFiles(subOrphan, 1);        // 孤儿残留仅 1 天前，不受 7 天窗口限制
+
+    const m = new CacheMaintenance(profile, trash, async () => false, {
+      geminiDir,
+      browserRunning: async () => false,
+      archiveDatabases: async () => ({ complete: true }),
+    });
+
+    // 活跃 RUNNING 会话在 3 分钟内有写入，hasRunningConversation 应返回 true
+    assert.equal(await m.hasRunningConversation(), true);
+
+    // 1. 测试保留近 30 天窗口：仅孤儿项进入清单，12 天前的历史瘦身项不出现
+    const scan30 = await m.scan({ retentionDays: 30 });
+    assert.equal(scan30.retentionDays, 30);
+    assert.ok(!scan30.entries.some(e => e.name === 'OrphanAgentData')); // 缺父关系不是安全删除证据
+    assert.ok(!scan30.entries.some(e => e.name === 'AgentSubagentDatabases'));
+    assert.ok(!scan30.entries.some(e => e.name === 'AgentTaskStepLogs'));
+
+    // 2. 测试默认保留近 7 天窗口：subOld(12d) 进入 AgentSubagentDatabases，subRecent(2d)/subArchived(20d)/subRunning(20d)/rootOld(12d) 不进入
+    const scan7 = await m.scan({ retentionDays: 7 });
+    const subDb7 = scan7.entries.find(e => e.name === 'AgentSubagentDatabases');
+    assert.ok(subDb7 && subDb7.category === 'stateful' && subDb7.defaultSelected === false);
+    assert.equal(subDb7.itemCount, 1); // 严格只有 subOld 1 个！
+
+    // 3. 测试全部非活跃（retentionDays = 0）：subOld(12d) 与 subRecent(2d) 均进入，共 2 个；归档树与运行树依然受保护
+    const scan0 = await m.scan({ retentionDays: 0 });
+    const subDb0 = scan0.entries.find(e => e.name === 'AgentSubagentDatabases');
+    assert.ok(subDb0);
+    assert.equal(subDb0.itemCount, 2);
+
+    // 执行 7 天窗口全项清理（含无损孤儿 + 3 项历史深度瘦身）
+    const scanExec = await m.scan({ retentionDays: 7 });
+    await m.clear(scanExec.token, [
+      'AgentTaskStepLogs',
+      'AgentVerboseTranscripts',
+      'AgentSubagentDatabases',
+    ]);
+
+    // 验证孤儿数据与 subOld.db 已被移入废纸篓
+    assert.ok(await lstat(join(convDir, `${subOrphan}.db`)));
+    assert.ok(await lstat(join(brainDir, subOrphan)));
+    await assert.rejects(lstat(join(convDir, `${subOld}.db`)));
+
+    // 验证主对话 rootOld.db、正式产物 design_plan.md 与紧凑版 transcript.jsonl 100% 完好保留！
+    assert.equal(await readFile(join(convDir, `${rootOld}.db`), 'utf8'), `db-${rootOld}`);
+    assert.equal(await readFile(join(brainDir, rootOld, 'design_plan.md'), 'utf8'), `artifact-${rootOld}`);
+    assert.equal(
+      await readFile(join(brainDir, rootOld, '.system_generated', 'logs', 'transcript.jsonl'), 'utf8'),
+      `compact-${rootOld}`
+    );
+    await assert.rejects(lstat(join(brainDir, rootOld, '.system_generated', 'logs', 'transcript_full.jsonl')));
+    await assert.rejects(lstat(join(brainDir, rootOld, '.system_generated', 'tasks')));
+
+    // 验证 2 天内会话、已归档会话树与运行中会话树毫发无损
+    assert.equal(await readFile(join(convDir, `${subRecent}.db`), 'utf8'), `db-${subRecent}`);
+    assert.equal(await readFile(join(convDir, `${rootArchived}.db`), 'utf8'), `db-${rootArchived}`);
+    assert.equal(await readFile(join(convDir, `${subArchived}.db`), 'utf8'), `db-${subArchived}`);
+    assert.equal(await readFile(join(convDir, `${rootRunning}.db`), 'utf8'), `db-${rootRunning}`);
+    assert.equal(await readFile(join(convDir, `${subRunning}.db`), 'utf8'), `db-${subRunning}`);
+    assert.equal(
+      await readFile(join(brainDir, rootRunning, '.system_generated', 'logs', 'transcript_full.jsonl'), 'utf8'),
+      `full-${rootRunning}`
+    );
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('v2 存储治理: 清理孤儿与历史 Subagent .db 前自动固化本地 Token 账本，清理后统计零丢失、恢复后幂等零双计', async () => {
+  const temp = await realpath(await mkdtemp(join(tmpdir(), 'gb-maint-v2-ledger-')));
+  const profile = join(temp, 'profile');
+  const geminiDir = join(temp, 'gemini');
+  const trash = join(temp, 'trash');
+  const stateDir = join(temp, 'state');
+  await Promise.all([mkdir(profile), mkdir(geminiDir), mkdir(trash), mkdir(stateDir)]);
+
+  const agentDir = join(geminiDir, 'antigravity');
+  const convDir = join(agentDir, 'conversations');
+  await mkdir(convDir, { recursive: true });
+
+  const rootId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const subId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  const orphanId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+  const missingParent = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+
+  try {
+    await createSummariesDb(join(agentDir, 'conversation_summaries.db'), [
+      { id: rootId, parentId: '', status: 'CASCADE_RUN_STATUS_IDLE' },
+      { id: subId, parentId: rootId, status: 'CASCADE_RUN_STATUS_IDLE' },
+      { id: orphanId, parentId: missingParent, status: 'CASCADE_RUN_STATUS_IDLE' },
+    ]);
+
+    const tenDaysAgoSec = Math.floor((Date.now() - 10 * 86_400_000) / 1000);
+    const rootDb = join(convDir, `${rootId}.db`);
+    const subDb = join(convDir, `${subId}.db`);
+    const orphanDb = join(convDir, `${orphanId}.db`);
+
+    await createUsageDb(rootDb, { input: 1500, output: 1000, cached: 4000, tsSec: tenDaysAgoSec });
+    await createUsageDb(subDb, { input: 3000, output: 2000, cached: 8000, tsSec: tenDaysAgoSec + 10 });
+    await createUsageDb(orphanDb, { input: 500, output: 500, cached: 1000, tsSec: tenDaysAgoSec + 20 });
+
+    await setAgeDays(rootDb, 10);
+    await setAgeDays(subDb, 10);
+    await setAgeDays(orphanDb, 10);
+
+    const usageMgr = new UsageStatsManager({ geminiDir, stateDir });
+    const m = new CacheMaintenance(profile, trash, async () => false, {
+      geminiDir,
+      stateDir,
+      browserRunning: async () => false,
+      archiveDatabases: paths => usageMgr.archiveDatabasesBeforeClear(paths),
+      onMutated: () => usageMgr.invalidateCache(),
+    });
+
+    // 1. 清理前基准账单
+    const before = await usageMgr.getUsageSummary(true);
+    assert.equal(before.all_time.totals.input_tokens, 5000);
+    assert.equal(before.all_time.totals.output_tokens, 3500);
+    assert.equal(before.all_time.totals.cached_tokens, 13000);
+    assert.equal(before.all_time.totals.total_tokens, 21500);
+    assert.equal(before.all_time.totals.request_count, 3);
+    assert.ok(before.all_time.estimated_usd > 0);
+    const baselineUsd = before.all_time.estimated_usd;
+
+    // 2. 清理孤儿与历史 Subagent 数据库
+    const scan = await m.scan({ retentionDays: 7 });
+    const cleared = await m.clear(scan.token, ['AgentSubagentDatabases']);
+    assert.equal(cleared.moved, 1);
+    await assert.rejects(lstat(subDb));
+    assert.ok(await lstat(orphanDb));
+
+    // 验证归档账本文件已生成，且清理后统计数据与历史事件明细 100% 零损一致
+    const archiveRaw = JSON.parse(await readFile(join(stateDir, 'usage-archived-events.json'), 'utf8'));
+    assert.equal(Object.keys(archiveRaw.databases).length, 1);
+
+    const afterClear = await usageMgr.getUsageSummary(true);
+    assert.equal(afterClear.all_time.totals.input_tokens, 5000);
+    assert.equal(afterClear.all_time.totals.output_tokens, 3500);
+    assert.equal(afterClear.all_time.totals.cached_tokens, 13000);
+    assert.equal(afterClear.all_time.totals.total_tokens, 21500);
+    assert.equal(afterClear.all_time.totals.request_count, 3);
+    assert.equal(afterClear.all_time.estimated_usd, baselineUsd);
+
+    const eventsAfterClear = await usageMgr.getUsageEvents('all', '', 0, 20, undefined, false, true);
+    assert.equal(eventsAfterClear.total, 3);
+
+    // 验证历史重估功能对已归档事件同样兼容无误
+    const revalued = await usageMgr.revalueHistory(true, { previewId: (await usageMgr.previewRevalueHistory()).previewId });
+    assert.equal(revalued.before, baselineUsd);
+    assert.equal(revalued.after, baselineUsd);
+
+    // 3. 从废纸篓一键原位还原两个 .db 后，验证 event_key 幂等去重，绝不重复双倍计费
+    const restored = await m.restore(basename(cleared.restorePath));
+    assert.equal(restored.restored, 1);
+    assert.ok(await lstat(subDb));
+    assert.ok(await lstat(orphanDb));
+
+    const afterRestore = await usageMgr.getUsageSummary(true);
+    assert.equal(afterRestore.all_time.totals.input_tokens, 5000);
+    assert.equal(afterRestore.all_time.totals.output_tokens, 3500);
+    assert.equal(afterRestore.all_time.totals.cached_tokens, 13000);
+    assert.equal(afterRestore.all_time.totals.total_tokens, 21500);
+    assert.equal(afterRestore.all_time.totals.request_count, 3);
+    assert.equal(afterRestore.all_time.estimated_usd, baselineUsd);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('v2 存储治理: 独立浏览器沙箱占用时局部跳过 AgentBrowserCache，不回滚其余清理项', async () => {
+  const temp = await realpath(await mkdtemp(join(tmpdir(), 'gb-maint-v2-busy-bp-')));
+  const profile = join(temp, 'profile');
+  const geminiDir = join(temp, 'gemini');
+  const trash = join(temp, 'trash');
+  await Promise.all([mkdir(profile), mkdir(geminiDir), mkdir(trash)]);
+
+  try {
+    await mkdir(join(profile, 'Cache'), { recursive: true });
+    await writeFile(join(profile, 'Cache', 'main.bin'), 'app-cache');
+    const bpCache = join(geminiDir, 'antigravity', 'browser_profile', 'Default', 'Cache');
+    await mkdir(bpCache, { recursive: true });
+    await writeFile(join(bpCache, 'web.bin'), 'busy-browser-cache');
+
+    const m = new CacheMaintenance(profile, trash, async () => false, {
+      geminiDir,
+      browserRunning: async () => true,
+    });
+
+    const scan = await m.scan();
+    assert.equal(scan.browserBusy, true);
+
+    // 同时勾选 Cache 与 AgentBrowserCache：Cache 正常清理，AgentBrowserCache 安全跳过
+    const res = await m.clear(scan.token, ['Cache', 'AgentBrowserCache']);
+    assert.equal(res.moved, 1);
+    assert.deepEqual(res.skipped, ['AgentBrowserCache']);
+    assert.match(res.message, /浏览器沙箱正在使用中/);
+    await assert.rejects(lstat(join(profile, 'Cache')));
+    assert.equal(await readFile(join(bpCache, 'web.bin'), 'utf8'), 'busy-browser-cache');
+
+    // 单独仅清理 AgentBrowserCache 且浏览器占用时，给出友好阻断提示
+    const scanOnlyBp = await m.scan();
+    await assert.rejects(
+      m.clear(scanOnlyBp.token, ['AgentBrowserCache']),
+      /独立浏览器沙箱正在使用中/
+    );
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('v2 存储治理: 回收仓不可用(Windows 版模拟:路径被文件占用,mkdir/scandir 报 ENOTDIR/EACCES)时退出重扫、清理、历史与原位恢复自动回退本地安全回收仓且不污染保护数据统计', async () => {
+  const { hasAntigravityCommand } = await import('../dist/core/maintenance.js');
+  const temp = await realpath(await mkdtemp(join(tmpdir(), 'gb-maint-v2-tcc-trash-')));
+  const profile = join(temp, 'profile');
+  const geminiDir = join(temp, 'gemini');
+  const blockedTrash = join(temp, 'blocked-trash');
+  const stateDir = join(temp, 'state');
+  await Promise.all([mkdir(profile), mkdir(geminiDir), mkdir(stateDir)]);
+
+  try {
+    // Windows 适配:上游用 macOS TCC(chmod 0o000)使 ~/.Trash 拒绝访问;Windows 的 chmod
+    // 不影响 NTFS 访问,等效模拟是在回收仓路径放一个普通文件,mkdir/scandir 必然失败。
+    await writeFile(blockedTrash, 'not-a-directory');
+
+    // 验证官方安装形态的进程(Antigravity.exe 与子进程 language_server.exe)均被准确识别为运行态
+    assert.equal(
+      hasAntigravityCommand([join(process.env.LOCALAPPDATA ?? '', 'Programs', 'antigravity', 'Antigravity.exe')]),
+      true
+    );
+    assert.equal(
+      hasAntigravityCommand([join(process.env.LOCALAPPDATA ?? '', 'Programs', 'antigravity', 'resources', 'bin', 'language_server.exe')]),
+      true
+    );
+    // Windows 真实形态:Win32_Process 命令行带引号;sidecar 经 cmd.exe 从 %APPDATA%\Antigravity\bin 启动
+    assert.equal(
+      hasAntigravityCommand([`"${join(process.env.LOCALAPPDATA ?? '', 'Programs', 'antigravity', 'Antigravity.exe')}"  --import=file:///main.mjs`]),
+      true
+    );
+    assert.equal(
+      hasAntigravityCommand([`C:\\WINDOWS\\system32\\cmd.exe /c ""${join(process.env.APPDATA ?? '', 'Antigravity', 'bin', 'agy-node.cmd')}" --import=file:///main.mjs main.mjs"`]),
+      true
+    );
+    assert.equal(hasAntigravityCommand(['notepad.exe C:\\elsewhere\\note.txt']), false);
+
+    // 准备真实缓存与核心受保护数据
+    await mkdir(join(profile, 'Cache'), { recursive: true });
+    await writeFile(join(profile, 'Cache', 'a.bin'), Buffer.alloc(2048, 7));
+    await mkdir(join(profile, 'Code Cache'), { recursive: true });
+    await writeFile(join(profile, 'Code Cache', 'b.bin'), Buffer.alloc(1024, 9));
+    await writeFile(join(stateDir, 'config.json'), '{"schema":2}');
+
+    // Windows 适配:文件占位使回收仓路径 mkdir/scandir 必然失败(等效上游 TCC 拒访)。
+    await writeFile(blockedTrash, 'not-a-directory');
+
+    let appIsRunning = true;
+    const m = new CacheMaintenance(profile, blockedTrash, async () => appIsRunning, {
+      geminiDir,
+      stateDir,
+      browserRunning: async () => false,
+    });
+
+    // 1. 运行态首次扫描正常，且自动标记使用本地回退安全回收仓
+    const runningScan = await m.scan();
+    assert.equal(runningScan.running, true);
+    assert.equal(runningScan.usingFallbackTrash, true);
+    assert.equal(runningScan.trashDir, join(stateDir, 'maintenance-trash'));
+
+    // 2. 模拟用户点击「退出并清理」：Antigravity 退出后执行重扫，绝不再抛 EPERM/EACCES scandir
+    appIsRunning = false;
+    const postQuitScan = await m.scan();
+    assert.equal(postQuitScan.running, false);
+    assert.equal(postQuitScan.usingFallbackTrash, true);
+    const baselineGravityBoxBytes = postQuitScan.protectedEntries.find(e => e.id === 'gravitybox')?.bytes ?? 0;
+    assert.ok(baselineGravityBoxBytes > 0);
+
+    // 3. 执行清理：自动落入 stateDir/maintenance-trash，且重扫时不会把回收快照计入 GravityBox 核心保护数据体积
+    const cleared = await m.clear(postQuitScan.token, ['Cache', 'Code Cache']);
+    assert.equal(cleared.moved, 2);
+    assert.equal(cleared.usingFallbackTrash, true);
+    assert.ok(cleared.restorePath.startsWith(join(stateDir, 'maintenance-trash')));
+    await assert.rejects(lstat(join(profile, 'Cache')));
+    await assert.rejects(lstat(join(profile, 'Code Cache')));
+
+    const afterClearScan = await m.scan();
+    const afterGravityBoxBytes = afterClearScan.protectedEntries.find(e => e.id === 'gravitybox')?.bytes ?? 0;
+    assert.equal(afterGravityBoxBytes, baselineGravityBoxBytes, '本地回退回收仓中的缓存快照绝不能虚增 GravityBox 受保护凭据体积');
+    assert.equal(afterClearScan.snapshots.length, 1);
+    assert.equal(afterClearScan.snapshots[0].restorable, true);
+    assert.equal(afterClearScan.snapshots[0].snapshotPath, cleared.restorePath);
+
+    // 4. 原位恢复：无需访问受限的 ~/.Trash 即可完整一键还原
+    const restored = await m.restore(afterClearScan.snapshots[0].id);
+    assert.equal(restored.restored, 2);
+    assert.equal((await lstat(join(profile, 'Cache', 'a.bin'))).size, 2048);
+    assert.equal((await lstat(join(profile, 'Code Cache', 'b.bin'))).size, 1024);
+
+    // 5. 若目标在退出后已自然为空（0 B / 不存在），clear 不会生成空快照目录
+    const emptyScan = await m.scan();
+    await rm(join(profile, 'GPUCache'), { recursive: true, force: true });
+    const emptyScan2 = await m.scan();
+    const zeroClear = await m.clear(emptyScan2.token, ['GPUCache']);
+    assert.equal(zeroClear.moved, 0);
+    assert.equal(zeroClear.restorePath, '');
+    assert.equal((await m.history()).length, 1, '0 字节无实际移动时不得生成新的空快照');
+  } finally {
+    await rm(temp, { recursive: true, force: true, maxRetries: 3 });
+  }
+});
+
+test('v3 三卡片双开关: scan 双桶聚合、smartClear 免令牌清理、局部跳过符号链接/繁忙浏览器子项与回退仓单快照轮转', async () => {
+  const { chmod, symlink } = await import('node:fs/promises');
+  const temp = await realpath(await mkdtemp(join(tmpdir(), 'gb-maint-v3-smart-')));
+  const profile = join(temp, 'profile');
+  const geminiDir = join(temp, 'gemini');
+  const blockedTrash = join(temp, 'blocked-trash');
+  const stateDir = join(temp, 'state');
+  const extTarget = join(temp, 'outside-gpu');
+  // Windows 适配:blockedTrash 不建目录,以文件占位模拟"回收仓不可用"(chmod 对 NTFS 访问无效)。
+  await Promise.all([mkdir(profile), mkdir(geminiDir), mkdir(stateDir), mkdir(extTarget)]);
+
+  const agentDir = join(geminiDir, 'antigravity');
+  const convDir = join(agentDir, 'conversations');
+  const brainDir = join(agentDir, 'brain');
+  await mkdir(convDir, { recursive: true });
+  await mkdir(brainDir, { recursive: true });
+
+  const rootId = '10101010-1010-4010-8010-101010101010';
+  const subId = '20202020-2020-4020-8020-202020202020';
+
+  try {
+    await writeFile(blockedTrash, 'not-a-directory');
+    await createSummariesDb(join(agentDir, 'conversation_summaries.db'), [
+      { id: rootId, parentId: '', status: 'CASCADE_RUN_STATUS_IDLE' },
+      { id: subId, parentId: rootId, status: 'CASCADE_RUN_STATUS_IDLE' },
+    ]);
+
+    const tenDaysAgoSec = Math.floor((Date.now() - 10 * 86_400_000) / 1000);
+    const rootDb = join(convDir, `${rootId}.db`);
+    const subDb = join(convDir, `${subId}.db`);
+    await createUsageDb(rootDb, { input: 1200, output: 800, cached: 2000, tsSec: tenDaysAgoSec });
+    await createUsageDb(subDb, { input: 2400, output: 1600, cached: 4000, tsSec: tenDaysAgoSec + 5 });
+    await setAgeDays(rootDb, 10);
+    await setAgeDays(subDb, 10);
+
+    await mkdir(join(brainDir, rootId, '.system_generated', 'tasks'), { recursive: true });
+    await writeFile(join(brainDir, rootId, '.system_generated', 'tasks', 'step.log'), Buffer.alloc(4096, 3));
+    await setAgeDays(join(brainDir, rootId), 10);
+
+    // 准备运行缓存：Cache 正常，GPUCache 为符号链接（应静默跳过而非阻断整桶），AgentBrowserCache 处于繁忙态
+    await mkdir(join(profile, 'Cache'), { recursive: true });
+    await writeFile(join(profile, 'Cache', 'chunk.bin'), Buffer.alloc(3072, 1));
+    // Windows 适配:目录符号链接需要管理员/开发者模式;junction 无需提权且 lstat 同样报 isSymbolicLink。
+    await symlink(extTarget, join(profile, 'GPUCache'), process.platform === 'win32' ? 'junction' : undefined);
+    const bpCache = join(agentDir, 'browser_profile', 'Default', 'Cache');
+    await mkdir(bpCache, { recursive: true });
+    await writeFile(join(bpCache, 'web.bin'), Buffer.alloc(1024, 2));
+
+    const usageMgr = new UsageStatsManager({ geminiDir, stateDir });
+    const m = new CacheMaintenance(profile, blockedTrash, async () => false, {
+      geminiDir,
+      stateDir,
+      browserRunning: async () => true,
+      archiveDatabases: paths => usageMgr.archiveDatabasesBeforeClear(paths),
+      onMutated: () => usageMgr.invalidateCache(),
+    });
+
+    // 1. 验证 scan() 输出双桶投影且排除符号链接子项
+    const scan1 = await m.scan({ retentionDays: 7 });
+    assert.ok(scan1.buckets);
+    assert.equal(scan1.buckets.runtimeCache.id, 'runtime_cache');
+    assert.equal(scan1.buckets.runtimeCache.available, true);
+    assert.equal(scan1.buckets.runtimeCache.clearableBytes, 3072 + 1024);
+    assert.equal(scan1.buckets.historyLogs.id, 'history_logs');
+    assert.equal(scan1.buckets.historyLogs.available, true);
+    assert.equal(scan1.buckets.historyLogs.subagentCount, 1);
+    assert.equal(scan1.latestRestorableSnapshot, null);
+
+    // 2. 无需传入 scan token，直接执行第一轮 smartClear(['runtime_cache'])：
+    //    自动跳过符号链接 GPUCache 与繁忙的 AgentBrowserCache，成功清理 Cache
+    const clear1 = await m.smartClear({ scopes: ['runtime_cache'], retentionDays: 7, keepLocalSnapshots: 1 });
+    assert.equal(clear1.ok, true);
+    assert.equal(clear1.moved, 1);
+    assert.equal(clear1.clearedBytes, 3072);
+    assert.ok(clear1.skipped.includes('GPUCache'));
+    assert.ok(clear1.skipped.includes('AgentBrowserCache'));
+    assert.equal(clear1.usingFallbackTrash, true);
+    assert.deepEqual(clear1.supersededSnapshotPaths, []);
+    await assert.rejects(lstat(join(profile, 'Cache')));
+    assert.ok((await lstat(join(profile, 'GPUCache'))).isSymbolicLink());
+    assert.ok(await lstat(join(bpCache, 'web.bin')));
+
+    // 等待 5ms 确保快照时间戳递增，再执行第二轮 smartClear(['history_logs'])：
+    //    验证 SQLite 账单自动归档，且第一轮旧快照被列入 supersededSnapshotPaths 供系统废纸篓接管
+    await new Promise(r => setTimeout(r, 5));
+    const baselineUsage = await usageMgr.getUsageSummary(true);
+    const clear2 = await m.smartClear({ scopes: ['history_logs'], retentionDays: 7, keepLocalSnapshots: 1 });
+    assert.equal(clear2.ok, true);
+    assert.equal(clear2.moved, 2);
+    assert.deepEqual(clear2.supersededSnapshotPaths, [clear1.restorePath]);
+    await assert.rejects(lstat(subDb));
+    assert.ok(await lstat(rootDb));
+
+    const afterHistoryClearUsage = await usageMgr.getUsageSummary(true);
+    assert.equal(afterHistoryClearUsage.all_time.totals.total_tokens, baselineUsage.all_time.totals.total_tokens);
+
+    // 模拟前端 FileManager.trashItem 移走 supersededSnapshotPaths 后，仅最新一次快照保留在本地支持一键撤回
+    await rm(clear1.restorePath, { recursive: true, force: true });
+    const scanAfter = await m.scan({ retentionDays: 7 });
+    assert.equal(scanAfter.latestRestorableSnapshot?.id, clear2.snapshotId);
+    const undone = await m.restore(scanAfter.latestRestorableSnapshot.id);
+    assert.equal(undone.ok, true);
+    assert.ok(await lstat(subDb));
+  } finally {
+    await rm(temp, { recursive: true, force: true, maxRetries: 3 });
+  }
+});
+

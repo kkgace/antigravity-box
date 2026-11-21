@@ -1,0 +1,80 @@
+{
+  "name": "antigravitybox",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "AntigravityBox: Windows companion workbench for Google Antigravity · Antigravity Windows 工作台 (port of Enzoo404/gravitybox, MIT)",
+  "license": "MIT",
+  "author": "kkgace <kkgace@users.noreply.github.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kkgace/antigravity-box.git"
+  },
+  "homepage": "https://github.com/kkgace/antigravity-box#readme",
+  "bugs": "https://github.com/kkgace/antigravity-box/issues",
+  "main": "dist/electron/main.js",
+  "scripts": {
+    "build": "node tools/build.mjs && node tools/make-ico.mjs",
+    "test": "node tools/run-tests.mjs",
+    "verify": "node tools/verify.mjs",
+    "start": "npm run build && electron .",
+    "e2e": "node tools/e2e-check.mjs",
+    "e2e:hud": "node tools/e2e-hud.mjs",
+    "e2e:m3": "node tools/e2e-m3.mjs",
+    "accept": "node tools/acceptance.mjs",
+    "package:win": "npm run accept && electron-builder --win nsis"
+  },
+  "build": {
+    "appId": "io.github.antigravitybox.workbench",
+    "productName": "AntigravityBox",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "!dist/**/*.map",
+      "renderer/icon.ico",
+      "!**/node_modules/**"
+    ],
+    "asar": true,
+    "asarUnpack": [
+      "dist/dict/**/*"
+    ],
+    "compression": "maximum",
+    "electronLanguages": [
+      "zh-CN",
+      "en-US"
+    ],
+    "afterPack": "tools/after-pack.cjs",
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ],
+      "icon": "renderer/icon.ico",
+      "artifactName": "AntigravityBox-Setup-${version}-x64.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "shortcutName": "AntigravityBox",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "electron": "^37.2.0",
+    "electron-builder": "^26.18.0",
+    "typescript": "5.9.3"
+  },
+  "engines": {
+    "node": ">=22.15.0"
+  },
+  "allowScripts": {
+    "electron@37.10.3": true
+  }
+}
